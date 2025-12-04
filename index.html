@@ -1,0 +1,218 @@
+/*
+3D Timelapse Forum - single-file React app
+
+How to use (read these steps BEFORE running):
+1) Create a Firebase project: https://console.firebase.google.com
+2) Enable Authentication -> Sign-in method -> Google
+3) Enable Firestore (in test mode for dev) and Firebase Storage
+4) Create a web app in Firebase and copy the firebaseConfig object below.
+5) Replace the placeholder FIREBASE_CONFIG below with your project's config.
+6) Install dependencies and run using your preferred React setup (Vite/Create React App).
+   This is a single-file React component you can drop into src/App.jsx.
+
+Security notes (important):
+- For production, secure Firestore and Storage rules so users can only write their own metadata and cannot overwrite others' files.
+- Limit upload size and check file types in rules and on the client.
+
+Features included in this file:
+- Sign in with Google (Firebase Auth)
+- Upload video files to Firebase Storage with progress indicator
+- Store video metadata in Firestore (uploader, title, createdAt, storagePath)
+- Simple feed showing uploaded videos with embedded <video> players
+- Basic client-side checks (file type, max size)
+
+This is intentionally compact and minimal — you can expand it with pagination, comments, likes, thumbnails generation, and transcoding via Cloud Functions.
+*/
+
+import React, { useEffect, useState } from "react";
+import { initializeApp } from "firebase/app";
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+} from "firebase/auth";
+import { getStorage, ref as storageRef, uploadBytesResumable, getDownloadURL } from "firebase/storage";
+import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp } from "firebase/firestore";
+
+// ====== REPLACE THIS WITH YOUR FIREBASE CONFIG ======
+const FIREBASE_CONFIG = {
+  apiKey: "REPLACE_ME",
+  authDomain: "REPLACE_ME",
+  projectId: "REPLACE_ME",
+  storageBucket: "REPLACE_ME",
+  messagingSenderId: "REPLACE_ME",
+  appId: "REPLACE_ME",
+};
+// ====================================================
+
+const app = initializeApp(FIREBASE_CONFIG);
+const auth = getAuth(app);
+const provider = new GoogleAuthProvider();
+const storage = getStorage(app);
+const db = getFirestore(app);
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [videos, setVideos] = useState([]);
+  const [file, setFile] = useState(null);
+  const [title, setTitle] = useState("");
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    const q = query(collection(db, "videos"), orderBy("createdAt", "desc"));
+    const unsub = onSnapshot(q, (snapshot) => {
+      const arr = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setVideos(arr);
+    });
+    return () => unsub();
+  }, []);
+
+  const login = async () => {
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (e) {
+      console.error(e);
+      setError("Błąd logowania: " + e.message);
+    }
+  };
+
+  const logout = async () => {
+    await signOut(auth);
+  };
+
+  const onFileChange = (e) => {
+    setError("");
+    const f = e.target.files[0];
+    if (!f) return;
+    // Accept only video types and limit size (e.g., 200MB here)
+    const maxSize = 200 * 1024 * 1024;
+    if (!f.type.startsWith("video/")) {
+      setError("Wybierz plik wideo.");
+      return;
+    }
+    if (f.size > maxSize) {
+      setError("Plik za duży. Limit: 200 MB.");
+      return;
+    }
+    setFile(f);
+  };
+
+  const upload = async (e) => {
+    e.preventDefault();
+    setError("");
+    if (!user) {
+      setError("Musisz się zalogować.");
+      return;
+    }
+    if (!file) {
+      setError("Wybierz plik.");
+      return;
+    }
+
+    const safeTitle = title.trim() || file.name;
+    const path = `videos/${user.uid}/${Date.now()}_${file.name}`;
+    const sRef = storageRef(storage, path);
+    const uploadTask = uploadBytesResumable(sRef, file);
+
+    uploadTask.on(
+      "state_changed",
+      (snapshot) => {
+        const prog = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+        setUploadProgress(prog);
+      },
+      (err) => {
+        console.error(err);
+        setError("Błąd uploadu: " + err.message);
+        setUploadProgress(null);
+      },
+      async () => {
+        try {
+          const url = await getDownloadURL(uploadTask.snapshot.ref);
+          // save metadata to Firestore
+          await addDoc(collection(db, "videos"), {
+            title: safeTitle,
+            storagePath: path,
+            url,
+            uid: user.uid,
+            displayName: user.displayName || user.email,
+            photoURL: user.photoURL || null,
+            createdAt: serverTimestamp(),
+          });
+
+          setFile(null);
+          setTitle("");
+          setUploadProgress(null);
+        } catch (err) {
+          console.error(err);
+          setError("Błąd po uploadzie: " + err.message);
+        }
+      }
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans">
+      <div className="max-w-4xl mx-auto bg-white shadow-lg rounded-2xl p-6">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold">3D Printer Timelapse Forum</h1>
+          <div className="flex items-center gap-3">
+            {user ? (
+              <>
+                <img src={user.photoURL || ""} alt="user" className="w-8 h-8 rounded-full" />
+                <span className="text-sm">{user.displayName || user.email}</span>
+                <button onClick={logout} className="ml-2 px-3 py-1 rounded bg-red-500 text-white">Wyloguj</button>
+              </>
+            ) : (
+              <button onClick={login} className="px-3 py-1 rounded bg-blue-600 text-white">Zaloguj przez Google</button>
+            )}
+          </div>
+        </header>
+
+        <section className="mb-6">
+          <form onSubmit={upload} className="flex flex-col gap-3">
+            <input type="text" placeholder="Tytuł (np. Ender 3 - PLA, 0.2mm)" value={title} onChange={(e) => setTitle(e.target.value)} className="p-2 border rounded" />
+            <input type="file" accept="video/*" onChange={onFileChange} />
+            {uploadProgress !== null && (
+              <div className="w-full bg-gray-200 h-3 rounded overflow-hidden">
+                <div style={{ width: `${uploadProgress}%` }} className="h-full bg-green-500" />
+              </div>
+            )}
+            {error && <div className="text-red-600">{error}</div>}
+            <div>
+              <button type="submit" className="px-4 py-2 rounded bg-green-600 text-white">Wyślij wideo</button>
+            </div>
+          </form>
+        </section>
+
+        <section>
+          <h2 className="text-xl font-semibold mb-3">Najnowsze timelapsy</h2>
+          {videos.length === 0 && <div>Brak wrzuconych filmów — bądź pierwszy!</div>}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {videos.map((v) => (
+              <article key={v.id} className="border rounded p-3 bg-gray-50">
+                <div className="flex items-center gap-3 mb-2">
+                  {v.photoURL && <img src={v.photoURL} alt="u" className="w-8 h-8 rounded-full" />}
+                  <div>
+                    <div className="text-sm font-medium">{v.displayName}</div>
+                    <div className="text-xs text-gray-500">{v.title}</div>
+                  </div>
+                </div>
+                <video controls style={{ width: "100%", maxHeight: 320 }} src={v.url} />
+              </article>
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
